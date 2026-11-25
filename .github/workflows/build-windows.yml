@@ -49,3 +49,15 @@ jobs:
       - name: Build
         shell: msys2 {0}
         run: cmake --build cmake-build-windows --parallel
+
+      - name: Package Windows installer
+        shell: msys2 {0}
+        run: cpack --config cmake-build-windows/CPackConfig.cmake -G NSIS
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: apollo-windows
+          path: cmake-build-windows/cpack_artifacts/Apollo.exe
+          if-no-files-found: error
+          retention-days: 14
