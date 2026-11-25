@@ -52,6 +52,8 @@
     "cmd": "Command",
     "cmd_desc": "The main application to start. If blank, no application will be started.",
     "cmd_note": "If the path to the command executable contains spaces, you must enclose it in quotes.",
+    "capture_window_title": "Capture Window Title",
+    "capture_window_title_desc": "On Windows, capture this exact window title from the application process group instead of the monitor. Leave empty for normal monitor capture. The title must match exactly and identify one window. Window capture requires Windows Graphics Capture (WGC), an application command, and no virtual display. Up to five window streams can run at once.",
     "cmd_prep_desc": "A list of commands to be run before/after this application. If any of the prep-commands fail, starting the application is aborted.",
     "cmd_prep_name": "Command Preparations",
     "cmd_state_desc": "A list of commands to be run when resuming(first client connects when no clients are connected) or pausing(all clients disconnect) this application.\nDo commands for resume and Undo command for pause.\nPlease make sure to clean up any side effects of the commands in the preparation undo commands.\nPlease note that pause command will not be executed when the session terminates.",

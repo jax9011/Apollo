@@ -468,6 +468,17 @@ namespace platf::dxgi {
 
     auto adapter_name = from_utf8(config::video.adapter_name);
     auto output_name = from_utf8(display_name);
+    if (config.capture_window_handle) {
+      auto hwnd = reinterpret_cast<HWND>(config.capture_window_handle);
+      auto monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+      MONITORINFOEXW monitor_info {};
+      monitor_info.cbSize = sizeof(monitor_info);
+      if (!monitor || !GetMonitorInfoW(monitor, &monitor_info)) {
+        BOOST_LOG(error) << "Failed to locate the display associated with the capture window";
+        return -1;
+      }
+      output_name = monitor_info.szDevice;
+    }
 
     adapter_t::pointer adapter_p;
     for (int tries = 0; tries < 2; ++tries) {
@@ -492,7 +503,8 @@ namespace platf::dxgi {
             continue;
           }
 
-          if (desc.AttachedToDesktop && test_dxgi_duplication(adapter_tmp, output_tmp, false)) {
+          if (desc.AttachedToDesktop &&
+              (config.capture_window_handle || test_dxgi_duplication(adapter_tmp, output_tmp, false))) {
             output = std::move(output_tmp);
 
             offset_x = desc.DesktopCoordinates.left;
@@ -994,6 +1006,30 @@ namespace platf {
    * @param hwdevice_type enables possible use of hardware encoder
    */
   std::shared_ptr<display_t> display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config) {
+    if (config.capture_window_handle) {
+      if (config::video.capture == "ddx") {
+        BOOST_LOG(error) << "Window capture requires the Windows Graphics Capture backend";
+        return nullptr;
+      }
+
+      if (config::video.capture == "wgc" || config::video.capture.empty()) {
+        if (hwdevice_type == mem_type_e::dxgi) {
+          auto disp = std::make_shared<dxgi::display_wgc_vram_t>();
+          if (!disp->init(config, display_name)) {
+            return disp;
+          }
+        } else if (hwdevice_type == mem_type_e::system) {
+          auto disp = std::make_shared<dxgi::display_wgc_ram_t>();
+          if (!disp->init(config, display_name)) {
+            return disp;
+          }
+        }
+      }
+
+      BOOST_LOG(error) << "Window capture is not supported by the selected encoder device";
+      return nullptr;
+    }
+
     if (config::video.capture == "ddx" || config::video.capture.empty()) {
       if (hwdevice_type == mem_type_e::dxgi) {
         auto disp = std::make_shared<dxgi::display_ddup_vram_t>();

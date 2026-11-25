@@ -237,6 +237,12 @@
             <b>{{ $t('_common.note') }}</b> {{ $t('apps.cmd_note') }}
           </div>
         </div>
+        <div class="mb-3" v-if="platform === 'windows'">
+          <label for="captureWindowTitle" class="form-label">{{ $t('apps.capture_window_title') }}</label>
+          <input type="text" class="form-control monospace" id="captureWindowTitle"
+            aria-describedby="captureWindowTitleHelp" v-model="editForm['capture-window-title']" />
+          <div id="captureWindowTitleHelp" class="form-text">{{ $t('apps.capture_window_title_desc') }}</div>
+        </div>
         <!-- elevation -->
         <Checkbox v-if="platform === 'windows'"
                   class="mb-3"
@@ -532,6 +538,7 @@
     "name": "New App",
     "output": "",
     "cmd": "",
+    "capture-window-title": "",
     "exclude-global-prep-cmd": false,
     "exclude-global-state-cmd": false,
     "elevated": false,

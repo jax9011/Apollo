@@ -4,6 +4,12 @@
  */
 #pragma once
 
+// standard includes
+#include <condition_variable>
+#include <cstddef>
+#include <memory>
+#include <mutex>
+
 // platform includes
 #include <d3d11.h>
 #include <d3d11_4.h>
@@ -341,15 +347,36 @@ namespace platf::dxgi {
    * Display duplicator that uses the Windows.Graphics.Capture API.
    */
   class wgc_capture_t {
+    struct callback_state_t {
+      std::mutex mutex;
+      std::condition_variable cv;
+      wgc_capture_t *owner {};
+      std::size_t active_callbacks {};
+    };
+
     winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice uwp_device {nullptr};
     winrt::Windows::Graphics::Capture::GraphicsCaptureItem item {nullptr};
     winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool frame_pool {nullptr};
     winrt::Windows::Graphics::Capture::GraphicsCaptureSession capture_session {nullptr};
     winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame produced_frame {nullptr}, consumed_frame {nullptr};
+    winrt::event_token closed_token {};
+    winrt::event_token frame_arrived_token {};
+    bool closed_subscribed {};
+    bool frame_arrived_subscribed {};
+    std::mutex frame_pool_mutex;
     SRWLOCK frame_lock = SRWLOCK_INIT;
     CONDITION_VARIABLE frame_present_cv;
+    bool item_closed {};
+    bool item_resized {};
+    bool capture_failed {};
+    bool window_capture {};
+    int target_width {};
+    int target_height {};
+    DXGI_FORMAT frame_pool_format {};
+    std::shared_ptr<callback_state_t> callback_state;
 
     void on_frame_arrived(winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool const &sender, winrt::Windows::Foundation::IInspectable const &);
+    void on_item_closed(winrt::Windows::Graphics::Capture::GraphicsCaptureItem const &, winrt::Windows::Foundation::IInspectable const &);
 
   public:
     wgc_capture_t();

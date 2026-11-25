@@ -4,6 +4,9 @@
  */
 #pragma once
 
+// standard includes
+#include <cstdint>
+
 // local includes
 #include "input.h"
 #include "platform/common.h"
@@ -48,6 +51,7 @@ namespace video {
 
     int encodingFramerate; // Requested display framerate
     bool input_only;
+    std::uintptr_t capture_window_handle = 0;
   };
 
   platf::mem_type_e map_base_dev_type(AVHWDeviceType type);

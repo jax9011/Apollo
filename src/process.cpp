@@ -9,6 +9,7 @@
 #endif
 // standard includes
 #include <filesystem>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -51,6 +52,14 @@
 namespace proc {
   using namespace std::literals;
   namespace pt = boost::property_tree;
+
+#ifdef _WIN32
+  namespace {
+    std::recursive_mutex window_app_launch_mutex;
+    std::mutex window_app_sessions_mutex;
+    std::unordered_map<uint32_t, std::unique_ptr<proc_t>> window_app_sessions;
+  }  // namespace
+#endif
 
   proc_t proc;
 
@@ -162,7 +171,23 @@ namespace proc {
     return cmd_path.parent_path();
   }
 
-  void proc_t::launch_input_only() {
+  int proc_t::launch_input_only() {
+#ifdef _WIN32
+    std::lock_guard launch_mode_lock(window_app_launch_mutex);
+    if (window_app_count() > 0) {
+      BOOST_LOG(warning) << "Refusing input-only launch while window-capture streams are active";
+      return 409;
+    }
+#endif
+    const auto current_app_id = running();
+    if (current_app_id > 0 && current_app_id != input_only_app_id) {
+      BOOST_LOG(warning) << "Refusing input-only launch while another app is running";
+      return 409;
+    }
+    if (current_app_id == input_only_app_id) {
+      return 0;
+    }
+
     _app_id = input_only_app_id;
     _app_name = "Remote Input";
     _app.uuid = REMOTE_INPUT_UUID;
@@ -173,9 +198,33 @@ namespace proc {
 #if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
     system_tray::update_tray_playing(_app_name);
 #endif
+    return 0;
   }
 
   int proc_t::execute(const ctx_t& app, std::shared_ptr<rtsp_stream::launch_session_t> launch_session) {
+#ifdef _WIN32
+    const bool window_capture = !app.capture_window_title.empty();
+#else
+    constexpr bool window_capture = false;
+#endif
+    if (window_capture && (app.virtual_display || app.cmd.empty())) {
+      BOOST_LOG(error) << "Window capture requires an application command and cannot use a virtual display";
+      return 400;
+    }
+#ifdef _WIN32
+    std::unique_lock<std::recursive_mutex> window_mode_lock;
+    if (this == &proc && !window_capture) {
+      window_mode_lock = std::unique_lock<std::recursive_mutex>(window_app_launch_mutex);
+      if (window_app_count() > 0) {
+        BOOST_LOG(warning) << "Refusing full-monitor app launch while window-capture streams are active";
+        return 409;
+      }
+    }
+#endif
+    if (window_capture) {
+      launch_session->virtual_display = false;
+    }
+
     if (_app_id == input_only_app_id) {
       terminate(false, false);
       std::this_thread::sleep_for(1s);
@@ -189,6 +238,7 @@ namespace proc {
     _app_name = app.name;
     _launch_session = launch_session;
     allow_client_commands = app.allow_client_commands;
+    launch_session->window_capture = window_capture;
 
     uint32_t client_width = launch_session->width ? launch_session->width : 1920;
     uint32_t client_height = launch_session->height ? launch_session->height : 1080;
@@ -220,10 +270,12 @@ namespace proc {
       // Restore to user defined output name
       config::video.output_name = this->initial_display;
       terminate();
-      display_device::revert_configuration();
+      if (!window_capture) {
+        display_device::revert_configuration();
+      }
     });
 
-    if (!app.gamepad.empty()) {
+    if (!window_capture && !app.gamepad.empty()) {
       _saved_input_config = std::make_shared<config::input_t>(config::input);
       if (app.gamepad == "disabled") {
         config::input.controller = false;
@@ -234,12 +286,12 @@ namespace proc {
     }
 
 #ifdef _WIN32
-    if (
+    if (!window_capture && (
       config::video.headless_mode        // Headless mode
       || launch_session->virtual_display // User requested virtual display
       || _app.virtual_display            // App is configured to use virtual display
       || !video::allow_encoder_probing() // No active display presents
-    ) {
+    )) {
       if (vDisplayDriverStatus != VDISPLAY::DRIVER_STATUS::OK) {
         // Try init driver again
         initVDisplayDriver();
@@ -334,17 +386,21 @@ namespace proc {
       }
     }
 
-    display_device::configure_display(config::video, *launch_session);
+    if (!window_capture) {
+      display_device::configure_display(config::video, *launch_session);
+    }
 
     // We should not preserve display state when using virtual display.
     // It is already handled by Windows properly.
-    if (this->virtual_display) {
+    if (!window_capture && this->virtual_display) {
       display_device::reset_persistence();
     }
 
 #else
 
-    display_device::configure_display(config::video, *launch_session);
+    if (!window_capture) {
+      display_device::configure_display(config::video, *launch_session);
+    }
 
 #endif
 
@@ -496,6 +552,7 @@ namespace proc {
     _app_launch_time = std::chrono::steady_clock::now();
 
   #ifdef _WIN32
+    if (!window_capture) {
     auto resetHDRThread = std::thread([this, enable_hdr = launch_session->enable_hdr]{
       // Windows doesn't seem to be able to set HDR correctly when a display is just connected / changed resolution,
       // so we have tooggle HDR for the virtual display manually after a delay.
@@ -549,6 +606,7 @@ namespace proc {
     });
 
     resetHDRThread.detach();
+    }
   #endif
 
     fg.disable();
@@ -586,7 +644,7 @@ namespace proc {
 
     #if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
       if (_process.native_exit_code() != 0) {
-        system_tray::update_tray_launch_error(proc::proc.get_last_run_app_name(), _process.native_exit_code());
+        system_tray::update_tray_launch_error(_app_name, _process.native_exit_code());
       }
     #endif
 
@@ -600,6 +658,103 @@ namespace proc {
 
     return 0;
   }
+
+#ifdef _WIN32
+  HWND proc_t::wait_for_window(const std::wstring &title, std::chrono::seconds timeout) {
+    if (!_process_group) {
+      BOOST_LOG(error) << "Cannot resolve a capture window because the app has no tracked process group";
+      return nullptr;
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+      auto hwnd = platf::find_window_in_process_group(
+        reinterpret_cast<std::uintptr_t>(_process_group.native_handle()),
+        title
+      );
+      if (hwnd) {
+        return hwnd;
+      }
+      if (!running()) {
+        BOOST_LOG(error) << "Application exited before its configured capture window appeared";
+        return nullptr;
+      }
+      std::this_thread::sleep_for(200ms);
+    }
+
+    BOOST_LOG(error) << "Timed out waiting for the configured application window";
+    return nullptr;
+  }
+
+  int start_window_app(const ctx_t &app, const std::shared_ptr<rtsp_stream::launch_session_t> &launch_session) {
+    std::lock_guard launch_mode_lock(window_app_launch_mutex);
+    auto app_config = app;
+    if (proc.running() > 0) {
+      BOOST_LOG(warning) << "Refusing window app launch while a full-monitor app is running";
+      return 409;
+    }
+
+    std::lock_guard lock(window_app_sessions_mutex);
+    if (window_app_sessions.size() >= MAX_WINDOW_APP_SESSIONS) {
+      BOOST_LOG(warning) << "Refusing window app launch: the limit of " << MAX_WINDOW_APP_SESSIONS << " concurrent window streams has been reached";
+      return 503;
+    }
+    if (window_app_sessions.contains(launch_session->id)) {
+      BOOST_LOG(error) << "A window app is already registered for launch session " << launch_session->id;
+      return 409;
+    }
+
+    auto apps = proc.get_apps();
+    auto instance = std::make_unique<proc_t>(proc.get_env(), std::move(apps));
+    const auto status = instance->execute(app_config, launch_session);
+    if (status) {
+      return status;
+    }
+
+    auto hwnd = instance->wait_for_window(platf::from_utf8(app_config.capture_window_title), 15s);
+    if (!hwnd) {
+      instance->terminate(false, false);
+      return 503;
+    }
+
+    launch_session->window_capture = true;
+    launch_session->capture_window_handle = reinterpret_cast<std::uintptr_t>(hwnd);
+    window_app_sessions.emplace(launch_session->id, std::move(instance));
+    return 0;
+  }
+
+  void resume_window_app(uint32_t launch_session_id) {
+    std::lock_guard lock(window_app_sessions_mutex);
+    const auto it = window_app_sessions.find(launch_session_id);
+    if (it != window_app_sessions.end()) {
+      it->second->resume();
+    }
+  }
+
+  void stop_window_app(uint32_t launch_session_id) {
+    std::lock_guard lock(window_app_sessions_mutex);
+    const auto it = window_app_sessions.find(launch_session_id);
+    if (it == window_app_sessions.end()) {
+      return;
+    }
+
+    it->second->terminate(false, false);
+    window_app_sessions.erase(it);
+  }
+
+  void terminate_window_apps() {
+    std::lock_guard lock(window_app_sessions_mutex);
+    for (auto &[_, instance] : window_app_sessions) {
+      instance->terminate(false, false);
+    }
+    window_app_sessions.clear();
+  }
+
+  std::size_t window_app_count() {
+    std::lock_guard lock(window_app_sessions_mutex);
+    return window_app_sessions.size();
+  }
+#endif
 
   void proc_t::resume() {
     BOOST_LOG(info) << "Session resuming for app [" << _app_name << "].";
@@ -699,13 +854,22 @@ namespace proc {
     }
 
 #if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
-    system_tray::update_tray_pausing(proc::proc.get_last_run_app_name());
+    system_tray::update_tray_pausing(_app_name);
 #endif
   }
 
   void proc_t::terminate(bool immediate, bool needs_refresh) {
+#ifdef _WIN32
+    std::unique_lock<std::recursive_mutex> launch_mode_lock;
+    if (this == &proc) {
+      launch_mode_lock = std::unique_lock<std::recursive_mutex>(window_app_launch_mutex);
+      terminate_window_apps();
+    }
+#endif
     std::error_code ec;
     placebo = false;
+    const auto app_name = _app_name;
+    const bool window_capture = _launch_session && _launch_session->window_capture;
 
     if (!immediate) {
       terminate_process_group(_process, _process_group, _app.exit_timeout);
@@ -756,7 +920,7 @@ namespace proc {
       }
     }
 
-    bool used_virtual_display = vDisplayDriverStatus == VDISPLAY::DRIVER_STATUS::OK && _launch_session && _launch_session->virtual_display;
+    bool used_virtual_display = !window_capture && vDisplayDriverStatus == VDISPLAY::DRIVER_STATUS::OK && _launch_session && _launch_session->virtual_display;
     if (used_virtual_display) {
       if (VDISPLAY::removeVirtualDisplay(_launch_session->display_guid)) {
         BOOST_LOG(info) << "Virtual Display removed successfully";
@@ -769,19 +933,19 @@ namespace proc {
 
     // Only show the Stopped notification if we actually have an app to stop
     // Since terminate() is always run when a new app has started
-    if (proc::proc.get_last_run_app_name().length() > 0 && has_run) {
+    if (!window_capture && !app_name.empty() && has_run) {
       if (used_virtual_display) {
         display_device::reset_persistence();
       } else {
         display_device::revert_configuration();
       }
 #else
-    if (proc::proc.get_last_run_app_name().length() > 0 && has_run) {
+    if (!window_capture && !app_name.empty() && has_run) {
       display_device::revert_configuration();
 #endif
 
 #if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
-      system_tray::update_tray_stopped(proc::proc.get_last_run_app_name());
+      system_tray::update_tray_stopped(app_name);
 #endif
     }
 
@@ -1349,6 +1513,10 @@ namespace proc {
           }
           if (app_node.contains("image-path"))
             ctx.image_path = parse_env_val(this_env, app_node.value("image-path", ""));
+#ifdef _WIN32
+          if (app_node.contains("capture-window-title"))
+            ctx.capture_window_title = parse_env_val(this_env, app_node.value("capture-window-title", ""));
+#endif
 
           ctx.elevated = app_node.value("elevated", false);
           ctx.auto_detach = app_node.value("auto-detach", true);

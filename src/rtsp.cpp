@@ -13,6 +13,7 @@ extern "C" {
 #include <array>
 #include <cctype>
 #include <format>
+#include <mutex>
 #include <set>
 #include <unordered_map>
 #include <utility>
@@ -27,6 +28,7 @@ extern "C" {
 #include "input.h"
 #include "logging.h"
 #include "network.h"
+#include "process.h"
 #include "rtsp.h"
 #include "stream.h"
 #include "sync.h"
@@ -402,6 +404,7 @@ namespace rtsp_stream {
   public:
     ~rtsp_server_t() {
       clear();
+      clear_pending_session();
     }
 
     int bind(net::af_e af, std::uint16_t port, boost::system::error_code &ec) {
@@ -489,25 +492,40 @@ namespace rtsp_stream {
      *       the session will be discarded.
      * @param launch_session Streaming session information.
      */
-    void session_raise(std::shared_ptr<launch_session_t> launch_session) {
+    bool session_raise(std::shared_ptr<launch_session_t> launch_session) {
+      std::lock_guard lock(_launch_mutex);
       // If a launch event is still pending, don't overwrite it.
       if (launch_event.view(0s)) {
-        return;
+        return false;
       }
 
+      const auto launch_session_id = launch_session->id;
       // Raise the new launch session to prepare for the RTSP handshake
       launch_event.raise(std::move(launch_session));
 
       // Arm the timer to expire this launch session if the client times out
       raised_timer.expires_after(config::stream.ping_timeout);
-      raised_timer.async_wait([this](const boost::system::error_code &ec) {
+      raised_timer.async_wait([this, launch_session_id](const boost::system::error_code &ec) {
         if (!ec) {
-          auto discarded = launch_event.pop(0s);
+          std::shared_ptr<launch_session_t> discarded;
+          {
+            std::lock_guard lock(_launch_mutex);
+            auto pending_session = launch_event.view(0s);
+            if (pending_session && pending_session->id == launch_session_id) {
+              discarded = launch_event.pop(0s);
+            }
+          }
           if (discarded) {
             BOOST_LOG(debug) << "Event timeout: "sv << discarded->unique_id;
+#ifdef _WIN32
+            if (discarded->window_capture) {
+              proc::stop_window_app(discarded->id);
+            }
+#endif
           }
         }
       });
+      return true;
     }
 
     /**
@@ -515,6 +533,7 @@ namespace rtsp_stream {
      * @param launch_session_id The ID of the session to clear.
      */
     void session_clear(uint32_t launch_session_id) {
+      std::lock_guard lock(_launch_mutex);
       // We currently only support a single pending RTSP session,
       // so the ID should always match the one for that session.
       auto launch_session = launch_event.view(0s);
@@ -522,10 +541,32 @@ namespace rtsp_stream {
         if (launch_session->id != launch_session_id) {
           BOOST_LOG(error) << "Attempted to clear unexpected session: "sv << launch_session_id << " vs "sv << launch_session->id;
         } else {
-          raised_timer.cancel();
+          boost::system::error_code ec;
+          raised_timer.cancel(ec);
+          if (ec) {
+            BOOST_LOG(error) << "Failed to cancel RTSP launch timeout: "sv << ec.message();
+          }
           launch_event.pop();
         }
       }
+    }
+
+    void clear_pending_session() {
+      std::shared_ptr<launch_session_t> pending_session;
+      {
+        std::lock_guard lock(_launch_mutex);
+        boost::system::error_code ec;
+        raised_timer.cancel(ec);
+        if (ec) {
+          BOOST_LOG(error) << "Failed to cancel pending RTSP launch timeout: "sv << ec.message();
+        }
+        pending_session = launch_event.pop(0s);
+      }
+#ifdef _WIN32
+      if (pending_session && pending_session->window_capture) {
+        proc::stop_window_app(pending_session->id);
+      }
+#endif
     }
 
     /**
@@ -598,9 +639,12 @@ namespace rtsp_stream {
      * @brief Stop the RTSP server.
      */
     void stop() {
-      acceptor.close();
+      boost::system::error_code ec;
+      acceptor.close(ec);
+      if (ec) {
+        BOOST_LOG(error) << "Failed to close RTSP acceptor: "sv << ec.message();
+      }
       io_context.stop();
-      clear();
     }
 
     std::shared_ptr<stream::session_t>
@@ -629,6 +673,7 @@ namespace rtsp_stream {
     }
 
   private:
+    std::mutex _launch_mutex;
     std::unordered_map<std::string_view, cmd_func_t> _map_cmd_cb;
 
     sync_util::sync_t<std::set<std::shared_ptr<stream::session_t>>> _session_slots;
@@ -642,8 +687,8 @@ namespace rtsp_stream {
 
   rtsp_server_t server {};
 
-  void launch_session_raise(std::shared_ptr<launch_session_t> launch_session) {
-    server.session_raise(std::move(launch_session));
+  bool launch_session_raise(std::shared_ptr<launch_session_t> launch_session) {
+    return server.session_raise(std::move(launch_session));
   }
 
   void launch_session_clear(uint32_t launch_session_id) {
@@ -760,6 +805,15 @@ namespace rtsp_stream {
     respond(sock, session, resp);
   }
 
+  void discard_failed_launch(rtsp_server_t *server, launch_session_t &session) {
+    server->session_clear(session.id);
+#ifdef _WIN32
+    if (session.window_capture) {
+      proc::stop_window_app(session.id);
+    }
+#endif
+  }
+
   void cmd_not_found(tcp::socket &sock, launch_session_t &session, msg_t &&req) {
     respond(sock, session, nullptr, 404, "NOT FOUND", req->sequenceNumber, {});
   }
@@ -795,7 +849,15 @@ namespace rtsp_stream {
     uint32_t encryption_flags_requested = SS_ENC_CONTROL_V2;
 
     // Determine the encryption desired for this remote endpoint
-    auto encryption_mode = net::encryption_mode_for_address(sock.remote_endpoint().address());
+    boost::system::error_code endpoint_error;
+    const auto remote_endpoint = sock.remote_endpoint(endpoint_error);
+    if (endpoint_error) {
+      BOOST_LOG(error) << "RTSP DESCRIBE: Couldn't determine client endpoint: "sv << endpoint_error.message();
+      discard_failed_launch(server, session);
+      respond(sock, session, &option, 500, "Internal Server Error", req->sequenceNumber, {});
+      return;
+    }
+    auto encryption_mode = net::encryption_mode_for_address(remote_endpoint.address());
     if (encryption_mode != config::ENCRYPTION_MODE_NEVER) {
       // Advertise support for video encryption if it's not disabled
       encryption_flags_supported |= SS_ENC_VIDEO;
@@ -860,6 +922,10 @@ namespace rtsp_stream {
   }
 
   void cmd_setup(rtsp_server_t *server, tcp::socket &sock, launch_session_t &session, msg_t &&req) {
+    auto discard_launch_on_failure = util::fail_guard([&]() {
+      discard_failed_launch(server, session);
+    });
+
     OPTION_ITEM options[4] {};
 
     auto &seqn = options[0];
@@ -1040,6 +1106,7 @@ namespace rtsp_stream {
       }
 
       config.monitor.input_only = session.input_only;
+      config.monitor.capture_window_handle = session.capture_window_handle;
 
       configuredBitrateKbps = util::from_view(args.at("x-ml-video.configuredBitrateKbps"sv));
 
@@ -1147,7 +1214,14 @@ namespace rtsp_stream {
     }
 
     // Check that any required encryption is enabled
-    auto encryption_mode = net::encryption_mode_for_address(sock.remote_endpoint().address());
+    boost::system::error_code endpoint_error;
+    const auto remote_endpoint = sock.remote_endpoint(endpoint_error);
+    if (endpoint_error) {
+      BOOST_LOG(error) << "RTSP SETUP: Couldn't determine client endpoint: "sv << endpoint_error.message();
+      respond(sock, session, &option, 500, "Internal Server Error", req->sequenceNumber, {});
+      return;
+    }
+    auto encryption_mode = net::encryption_mode_for_address(remote_endpoint.address());
     if (encryption_mode == config::ENCRYPTION_MODE_MANDATORY &&
         (config.encryptionFlagsEnabled & (SS_ENC_VIDEO | SS_ENC_AUDIO)) != (SS_ENC_VIDEO | SS_ENC_AUDIO)) {
       BOOST_LOG(error) << "Rejecting client that cannot comply with mandatory encryption requirement"sv;
@@ -1159,7 +1233,7 @@ namespace rtsp_stream {
     auto stream_session = stream::session::alloc(config, session);
     server->insert(stream_session);
 
-    if (stream::session::start(*stream_session, sock.remote_endpoint().address().to_string())) {
+    if (stream::session::start(*stream_session, remote_endpoint.address().to_string())) {
       BOOST_LOG(error) << "Failed to start a streaming session"sv;
 
       server->remove(stream_session);
@@ -1168,6 +1242,7 @@ namespace rtsp_stream {
     }
 
     respond(sock, session, &option, 200, "OK", req->sequenceNumber, {});
+    discard_launch_on_failure.disable();
   }
 
   void cmd_play(rtsp_server_t *server, tcp::socket &sock, launch_session_t &session, msg_t &&req) {
@@ -1222,6 +1297,8 @@ namespace rtsp_stream {
     // Stop the server and join the server thread
     server.stop();
     rtsp_thread.join();
+    server.clear();
+    server.clear_pending_session();
   }
 
   void print_msg(PRTSP_MESSAGE msg) {

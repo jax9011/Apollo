@@ -6,6 +6,7 @@
 
 // standard includes
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <list>
 
@@ -39,6 +40,8 @@ namespace rtsp_stream {
     crypto::PERM perm;
 
     bool input_only;
+    bool window_capture {};
+    std::uintptr_t capture_window_handle {};
     bool host_audio;
     int width;
     int height;
@@ -63,7 +66,7 @@ namespace rtsp_stream {
   #endif
   };
 
-  void launch_session_raise(std::shared_ptr<launch_session_t> launch_session);
+  bool launch_session_raise(std::shared_ptr<launch_session_t> launch_session);
 
   /**
    * @brief Clear state for the specified launch session.

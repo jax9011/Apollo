@@ -6,7 +6,9 @@
 #include <atomic>
 #include <bitset>
 #include <list>
+#include <mutex>
 #include <thread>
+#include <unordered_map>
 
 // lib includes
 #include <boost/pointer_cast.hpp>
@@ -468,10 +470,27 @@ namespace video {
     safe::signal_t reinit_event;
     const encoder_t *encoder_p;
     sync_util::sync_t<std::weak_ptr<platf::display_t>> display_wp;
+
+    ~capture_thread_async_ctx_t() {
+      if (capture_ctx_queue) {
+        capture_ctx_queue->stop();
+      }
+      if (capture_thread.joinable()) {
+        capture_thread.join();
+      }
+    }
   };
 
   struct capture_thread_sync_ctx_t {
     encode_session_ctx_queue_t encode_session_ctx_queue {30};
+    std::thread capture_thread;
+
+    ~capture_thread_sync_ctx_t() {
+      encode_session_ctx_queue.stop();
+      if (capture_thread.joinable()) {
+        capture_thread.join();
+      }
+    }
   };
 
   int start_capture_sync(capture_thread_sync_ctx_t &ctx);
@@ -479,9 +498,12 @@ namespace video {
   int start_capture_async(capture_thread_async_ctx_t &ctx);
   void end_capture_async(capture_thread_async_ctx_t &ctx);
 
-  // Keep a reference counter to ensure the capture thread only runs when other threads have a reference to the capture thread
-  auto capture_thread_async = safe::make_shared<capture_thread_async_ctx_t>(start_capture_async, end_capture_async);
-  auto capture_thread_sync = safe::make_shared<capture_thread_sync_ctx_t>(start_capture_sync, end_capture_sync);
+  std::mutex capture_thread_contexts_mutex;
+  std::unordered_map<std::uintptr_t, std::weak_ptr<capture_thread_async_ctx_t>> capture_thread_async_contexts;
+  std::unordered_map<std::uintptr_t, std::weak_ptr<capture_thread_sync_ctx_t>> capture_thread_sync_contexts;
+
+  std::shared_ptr<capture_thread_async_ctx_t> get_capture_thread_async(std::uintptr_t target);
+  std::shared_ptr<capture_thread_sync_ctx_t> get_capture_thread_sync(std::uintptr_t target);
 
 #ifdef _WIN32
   encoder_t nvenc {
@@ -1177,10 +1199,17 @@ namespace video {
     std::vector<std::string> display_names;
     int display_p = -1;
     std::shared_ptr<platf::display_t> disp;
-    if (!proc::proc.display_name.empty()) {
+    const bool window_capture = capture_ctxs.front().config.capture_window_handle != 0;
+    if (window_capture) {
+      disp = platf::display(encoder.platform_formats->dev_type, "", capture_ctxs.front().config);
+      if (!disp) {
+        BOOST_LOG(error) << "Failed to initialize the selected window capture target";
+        return;
+      }
+    } else if (!proc::proc.display_name.empty()) {
       disp = platf::display(encoder.platform_formats->dev_type, proc::proc.display_name, capture_ctxs.front().config);
     }
-    if (!disp) {
+    if (!window_capture && !disp) {
       // Get all the monitor names now, rather than at boot, to
       // get the most up-to-date list available monitors
       refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
@@ -1320,7 +1349,7 @@ namespace video {
           capture_ctxs.emplace_back(std::move(*capture_ctx_queue->pop()));
         }
 
-        if (switch_display_event->peek()) {
+        if (!window_capture && switch_display_event->peek()) {
           artificial_reinit = true;
           return false;
         }
@@ -1371,23 +1400,34 @@ namespace video {
             }
 
             while (capture_ctx_queue->running()) {
-              // Release the display before reenumerating displays, since some capture backends
-              // only support a single display session per device/application.
+              // Release the display before reinitializing capture.
               disp.reset();
+              if (!window_capture) {
+                // Refresh display names since a display removal might have caused the reinitialization.
+                refresh_displays(encoder.platform_formats->dev_type, display_names, display_p, proc::proc.display_name);
 
-              // Refresh display names since a display removal might have caused the reinitialization
-              refresh_displays(encoder.platform_formats->dev_type, display_names, display_p, proc::proc.display_name);
-
-              // Process any pending display switch with the new list of displays
-              if (switch_display_event->peek()) {
-                display_p = std::clamp(*switch_display_event->pop(), 0, (int) display_names.size() - 1);
+                // Process any pending display switch with the new list of displays.
+                if (!window_capture && switch_display_event->peek()) {
+                  display_p = std::clamp(*switch_display_event->pop(), 0, (int) display_names.size() - 1);
+                }
               }
 
-              // reset_display() will sleep between retries
-              reset_display(disp, encoder.platform_formats->dev_type, display_names[display_p], capture_ctxs.front().config);
+              // reset_display() will sleep between retries.
+              reset_display(
+                disp,
+                encoder.platform_formats->dev_type,
+                window_capture ? "" : display_names[display_p],
+                capture_ctxs.front().config
+              );
               if (disp) {
-                proc::proc.display_name = display_names[display_p];
+                if (!window_capture) {
+                  proc::proc.display_name = display_names[display_p];
+                }
                 break;
+              }
+              if (window_capture) {
+                BOOST_LOG(error) << "The selected capture window is no longer available";
+                return;
               }
             }
             if (!disp) {
@@ -2205,19 +2245,29 @@ namespace video {
       synced_session_ctxs.emplace_back(std::make_unique<sync_session_ctx_t>(std::move(*ctx)));
     }
 
-    while (encode_session_ctx_queue.running()) {
-      // Refresh display names since a display removal might have caused the reinitialization
-      refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
+    const bool window_capture = synced_session_ctxs.front()->config.capture_window_handle != 0;
 
-      // Process any pending display switch with the new list of displays
-      if (switch_display_event->peek()) {
-        display_p = std::clamp(*switch_display_event->pop(), 0, (int) display_names.size() - 1);
+    if (window_capture) {
+      reset_display(disp, encoder.platform_formats->dev_type, "", synced_session_ctxs.front()->config);
+      if (!disp) {
+        BOOST_LOG(error) << "The selected capture window is no longer available";
+        return encode_e::error;
       }
+    } else {
+      while (encode_session_ctx_queue.running()) {
+        // Refresh display names since a display removal might have caused the reinitialization.
+        refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
 
-      // reset_display() will sleep between retries
-      reset_display(disp, encoder.platform_formats->dev_type, display_names[display_p], synced_session_ctxs.front()->config);
-      if (disp) {
-        break;
+        // Process any pending display switch with the new list of displays.
+        if (!window_capture && switch_display_event->peek()) {
+          display_p = std::clamp(*switch_display_event->pop(), 0, (int) display_names.size() - 1);
+        }
+
+        // reset_display() will sleep between retries.
+        reset_display(disp, encoder.platform_formats->dev_type, display_names[display_p], synced_session_ctxs.front()->config);
+        if (disp) {
+          break;
+        }
       }
     }
 
@@ -2307,7 +2357,7 @@ namespace video {
           ++pos;
         })
 
-        if (switch_display_event->peek()) {
+        if (!window_capture && switch_display_event->peek()) {
           ec = platf::capture_e::reinit;
           return false;
         }
@@ -2335,12 +2385,10 @@ namespace video {
     return encode_e::ok;
   }
 
-  void captureThreadSync() {
-    auto ref = capture_thread_sync.ref();
-
+  void captureThreadSync(capture_thread_sync_ctx_t &thread_ctx) {
     std::vector<std::unique_ptr<sync_session_ctx_t>> synced_session_ctxs;
 
-    auto &ctx = ref->encode_session_ctx_queue;
+    auto &ctx = thread_ctx.encode_session_ctx_queue;
     auto lg = util::fail_guard([&]() {
       ctx.stop();
 
@@ -2360,7 +2408,11 @@ namespace video {
 
     std::vector<std::string> display_names;
     int display_p = -1;
-    while (encode_run_sync(synced_session_ctxs, ctx, display_names, display_p) == encode_e::reinit) {}
+    while (ctx.running()) {
+      if (encode_run_sync(synced_session_ctxs, ctx, display_names, display_p) == encode_e::error) {
+        break;
+      }
+    }
   }
 
   void capture_async(
@@ -2376,8 +2428,9 @@ namespace video {
       shutdown_event->raise(true);
     });
 
-    auto ref = capture_thread_async.ref();
+    auto ref = get_capture_thread_async(config.capture_window_handle);
     if (!ref) {
+      BOOST_LOG(error) << "Failed to start a video capture worker";
       return;
     }
 
@@ -2459,7 +2512,11 @@ namespace video {
       capture_async(std::move(mail), config, channel_data);
     } else {
       safe::signal_t join_event;
-      auto ref = capture_thread_sync.ref();
+      auto ref = get_capture_thread_sync(config.capture_window_handle);
+      if (!ref) {
+        BOOST_LOG(error) << "Failed to start a synchronous video capture worker";
+        return;
+      }
       ref->encode_session_ctx_queue.raise(sync_session_ctx_t {
         &join_event,
         mail->event<bool>(mail::shutdown),
@@ -3015,11 +3072,61 @@ namespace video {
   }
 
   int start_capture_sync(capture_thread_sync_ctx_t &ctx) {
-    std::thread {&captureThreadSync}.detach();
+    ctx.capture_thread = std::thread {&captureThreadSync, std::ref(ctx)};
     return 0;
   }
 
   void end_capture_sync(capture_thread_sync_ctx_t &ctx) {
+    ctx.encode_session_ctx_queue.stop();
+    if (ctx.capture_thread.joinable()) {
+      ctx.capture_thread.join();
+    }
+  }
+
+  std::shared_ptr<capture_thread_async_ctx_t> get_capture_thread_async(std::uintptr_t target) {
+    std::lock_guard lock(capture_thread_contexts_mutex);
+    for (auto it = capture_thread_async_contexts.begin(); it != capture_thread_async_contexts.end();) {
+      if (it->second.expired()) {
+        it = capture_thread_async_contexts.erase(it);
+      } else {
+        ++it;
+      }
+    }
+
+    if (auto existing = capture_thread_async_contexts[target].lock()) {
+      return existing;
+    }
+
+    auto context = std::make_shared<capture_thread_async_ctx_t>();
+    if (start_capture_async(*context)) {
+      BOOST_LOG(error) << "Failed to initialize the asynchronous video capture worker";
+      return nullptr;
+    }
+    capture_thread_async_contexts[target] = context;
+    return context;
+  }
+
+  std::shared_ptr<capture_thread_sync_ctx_t> get_capture_thread_sync(std::uintptr_t target) {
+    std::lock_guard lock(capture_thread_contexts_mutex);
+    for (auto it = capture_thread_sync_contexts.begin(); it != capture_thread_sync_contexts.end();) {
+      if (it->second.expired()) {
+        it = capture_thread_sync_contexts.erase(it);
+      } else {
+        ++it;
+      }
+    }
+
+    if (auto existing = capture_thread_sync_contexts[target].lock()) {
+      return existing;
+    }
+
+    auto context = std::make_shared<capture_thread_sync_ctx_t>();
+    if (start_capture_sync(*context)) {
+      BOOST_LOG(error) << "Failed to initialize the synchronous video capture worker";
+      return nullptr;
+    }
+    capture_thread_sync_contexts[target] = context;
+    return context;
   }
 
   platf::mem_type_e map_base_dev_type(AVHWDeviceType type) {

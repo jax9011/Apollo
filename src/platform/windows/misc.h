@@ -6,6 +6,7 @@
 
 // standard includes
 #include <chrono>
+#include <cstdint>
 #include <string_view>
 
 // platform includes
@@ -33,4 +34,6 @@ namespace platf {
    * @return The converted UTF-8 string.
    */
   std::string to_utf8(const std::wstring_view &string);
+
+  HWND find_window_in_process_group(std::uintptr_t native_handle, std::wstring_view title);
 }  // namespace platf

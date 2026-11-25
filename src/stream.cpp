@@ -2043,6 +2043,11 @@ namespace stream {
       session.audioThread.join();
       BOOST_LOG(debug) << "Waiting for control to end..."sv;
       session.controlEnd.view();
+#ifdef _WIN32
+      if (session.config.monitor.capture_window_handle) {
+        proc::stop_window_app(session.launch_session_id);
+      }
+#endif
       // Reset input on session stop to avoid stuck repeated keys
       BOOST_LOG(debug) << "Resetting Input..."sv;
       input::reset(session.input);
@@ -2076,7 +2081,11 @@ namespace stream {
           revert_display_config = true;
         }
 
-        if (revert_display_config) {
+        if (revert_display_config
+#ifdef _WIN32
+            && !session.config.monitor.capture_window_handle
+#endif
+        ) {
           display_device::revert_configuration();
         }
 
@@ -2120,8 +2129,19 @@ namespace stream {
       // If this is the first session, invoke the platform callbacks
       if (++running_sessions == 1) {
         platf::streaming_will_start();
+#ifdef _WIN32
+        if (!session.config.monitor.capture_window_handle) {
+          proc::proc.resume();
+        }
+#else
         proc::proc.resume();
+#endif
       }
+#ifdef _WIN32
+      if (session.config.monitor.capture_window_handle) {
+        proc::resume_window_app(session.launch_session_id);
+      }
+#endif
 
       if (!session.do_cmds.empty()) {
         auto exec_thread = std::thread([cmd_list = session.do_cmds]{

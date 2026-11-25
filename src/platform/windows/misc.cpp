@@ -1366,6 +1366,94 @@ namespace platf {
     return enum_ctx.requested_exit;
   }
 
+  struct find_window_context_t {
+    std::set<DWORD> process_ids;
+    std::wstring title;
+    HWND match {};
+    bool ambiguous {};
+  };
+
+  static BOOL CALLBACK find_window_in_group(HWND hwnd, LPARAM lParam) {
+    auto context = reinterpret_cast<find_window_context_t *>(lParam);
+    if (!IsWindowVisible(hwnd)) {
+      return TRUE;
+    }
+
+    DWORD process_id {};
+    GetWindowThreadProcessId(hwnd, &process_id);
+    if (!context->process_ids.contains(process_id)) {
+      return TRUE;
+    }
+
+    auto title_length = GetWindowTextLengthW(hwnd);
+    if (title_length <= 0) {
+      return TRUE;
+    }
+
+    std::wstring window_title(static_cast<std::size_t>(title_length) + 1, L'\0');
+    auto copied = GetWindowTextW(hwnd, window_title.data(), static_cast<int>(window_title.size()));
+    if (copied <= 0 || _wcsicmp(window_title.c_str(), context->title.c_str()) != 0) {
+      return TRUE;
+    }
+
+    if (context->match) {
+      context->ambiguous = true;
+      return FALSE;
+    }
+
+    context->match = hwnd;
+    return TRUE;
+  }
+
+  HWND find_window_in_process_group(std::uintptr_t native_handle, std::wstring_view title) {
+    if (native_handle == 0 || title.empty()) {
+      BOOST_LOG(error) << "Cannot find app window without a process group and exact window title";
+      return nullptr;
+    }
+
+    auto job_handle = reinterpret_cast<HANDLE>(native_handle);
+    DWORD required_length = sizeof(JOBOBJECT_BASIC_PROCESS_ID_LIST);
+    auto process_id_list = static_cast<PJOBOBJECT_BASIC_PROCESS_ID_LIST>(calloc(1, required_length));
+    if (!process_id_list) {
+      BOOST_LOG(error) << "Failed to allocate process group window lookup buffer";
+      return nullptr;
+    }
+    auto free_process_id_list = util::fail_guard([&process_id_list]() {
+      free(process_id_list);
+    });
+
+    BOOL success {};
+    while (!(success = QueryInformationJobObject(job_handle, JobObjectBasicProcessIdList, process_id_list, required_length, &required_length)) &&
+           GetLastError() == ERROR_MORE_DATA) {
+      free(process_id_list);
+      process_id_list = static_cast<PJOBOBJECT_BASIC_PROCESS_ID_LIST>(calloc(1, required_length));
+      if (!process_id_list) {
+        BOOST_LOG(error) << "Failed to allocate process group window lookup buffer";
+        return nullptr;
+      }
+    }
+    if (!success) {
+      BOOST_LOG(error) << "Failed to enumerate app process group for window lookup: " << GetLastError();
+      return nullptr;
+    }
+
+    find_window_context_t context;
+    context.title.assign(title);
+    for (DWORD i = 0; i < process_id_list->NumberOfProcessIdsInList; ++i) {
+      context.process_ids.emplace(static_cast<DWORD>(process_id_list->ProcessIdList[i]));
+    }
+
+    EnumWindows(find_window_in_group, reinterpret_cast<LPARAM>(&context));
+    if (context.ambiguous) {
+      BOOST_LOG(error) << "More than one app window matches the configured title";
+      return nullptr;
+    }
+    if (!context.match) {
+      BOOST_LOG(debug) << "No app window matches the configured title yet";
+    }
+    return context.match;
+  }
+
   bool process_group_running(std::uintptr_t native_handle) {
     JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting_info;
 

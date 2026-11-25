@@ -13,7 +13,9 @@
 #endif
 
 // standard includes
+#include <cstddef>
 #include <optional>
+#include <string>
 #include <unordered_map>
 
 // lib includes
@@ -85,6 +87,7 @@ namespace proc {
     std::string working_dir;
     std::string output;
     std::string image_path;
+    std::string capture_window_title;
     std::string id;
     std::string gamepad;
     bool elevated;
@@ -119,7 +122,7 @@ namespace proc {
         _apps(std::move(apps)) {
     }
 
-    void launch_input_only();
+    int launch_input_only();
 
     int execute(const ctx_t& _app, std::shared_ptr<rtsp_stream::launch_session_t> launch_session);
 
@@ -139,6 +142,10 @@ namespace proc {
     void resume();
     void pause();
     void terminate(bool immediate = false, bool needs_refresh = true);
+
+#ifdef _WIN32
+    HWND wait_for_window(const std::wstring &title, std::chrono::seconds timeout);
+#endif
 
   private:
     int _app_id = 0;
@@ -177,6 +184,16 @@ namespace proc {
   void refresh(const std::string &file_name, bool needs_terminate = true);
   void migrate_apps(nlohmann::json* fileTree_p, nlohmann::json* inputTree_p);
   std::optional<proc::proc_t> parse(const std::string &file_name);
+
+#ifdef _WIN32
+  constexpr std::size_t MAX_WINDOW_APP_SESSIONS = 5;
+
+  int start_window_app(const ctx_t &app, const std::shared_ptr<rtsp_stream::launch_session_t> &launch_session);
+  void resume_window_app(uint32_t launch_session_id);
+  void stop_window_app(uint32_t launch_session_id);
+  void terminate_window_apps();
+  std::size_t window_app_count();
+#endif
 
   /**
    * @brief Initialize proc functions

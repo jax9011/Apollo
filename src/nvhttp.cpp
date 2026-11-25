@@ -6,6 +6,7 @@
 #define BOOST_BIND_GLOBAL_PLACEHOLDERS
 
 // standard includes
+#include <exception>
 #include <filesystem>
 #include <format>
 #include <string>
@@ -1168,6 +1169,14 @@ namespace nvhttp {
     auto current_appid = proc::proc.running();
     auto current_app_uuid = proc::proc.get_running_app_uuid();
     bool is_input_only = config::input.enable_input_only_mode && (appid == proc::input_only_app_id || (appuuid_str == REMOTE_INPUT_UUID));
+    const auto &apps = proc::proc.get_apps();
+    const auto requested_app = std::find_if(apps.begin(), apps.end(), [&appid_str, &appuuid_str](const auto &_app) {
+      return _app.id == appid_str || (!appuuid_str.empty() && _app.uuid == appuuid_str);
+    });
+    bool app_uses_window_capture = false;
+#ifdef _WIN32
+    app_uses_window_capture = requested_app != apps.end() && !requested_app->capture_window_title.empty();
+#endif
 
     auto named_cert_p = get_verified_cert(request);
     auto perm = PERM::launch;
@@ -1177,7 +1186,8 @@ namespace nvhttp {
 
     // If we have already launched an app, we should allow clients with view permission to join the input only or current app's session.
     if (
-      current_appid > 0
+      !app_uses_window_capture
+      && current_appid > 0
       && (appuuid_str != TERMINATE_APP_UUID || appid != proc::terminate_app_id)
       && (is_input_only || appid == current_appid || (!appuuid_str.empty() && appuuid_str == current_app_uuid))
     ) {
@@ -1221,8 +1231,24 @@ namespace nvhttp {
         return;
       }
 
+#ifdef _WIN32
+      if (app_uses_window_capture && current_appid > 0) {
+        tree.put("root.resume", 0);
+        tree.put("root.<xmlattr>.status_code", 409);
+        tree.put("root.<xmlattr>.status_message", "A full-monitor app is already running on this host");
+        return;
+      }
+      if (!app_uses_window_capture && proc::window_app_count() > 0) {
+        tree.put("root.resume", 0);
+        tree.put("root.<xmlattr>.status_code", 409);
+        tree.put("root.<xmlattr>.status_message", "Window-capture streams are active on this host");
+        return;
+      }
+#endif
+
       if (
-        current_appid > 0
+        !app_uses_window_capture
+        && current_appid > 0
         && current_appid != proc::input_only_app_id
         && (
           (appid > 0 && appid != current_appid)
@@ -1237,10 +1263,23 @@ namespace nvhttp {
       }
     }
 
+    decltype(request->remote_endpoint()) remote_endpoint;
+    decltype(request->local_endpoint()) local_endpoint;
+    try {
+      remote_endpoint = request->remote_endpoint();
+      local_endpoint = request->local_endpoint();
+    } catch (const std::exception &e) {
+      BOOST_LOG(error) << "Failed to get HTTP request endpoints: "sv << e.what();
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message", "Could not determine the client or host address");
+      return;
+    }
+
     host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
     auto launch_session = make_launch_session(host_audio, is_input_only, args, named_cert_p);
 
-    auto encryption_mode = net::encryption_mode_for_address(request->remote_endpoint().address());
+    auto encryption_mode = net::encryption_mode_for_address(remote_endpoint.address());
     if (!launch_session->rtsp_cipher && encryption_mode == config::ENCRYPTION_MODE_MANDATORY) {
       BOOST_LOG(error) << "Rejecting client that cannot comply with mandatory encryption requirement"sv;
 
@@ -1253,6 +1292,28 @@ namespace nvhttp {
 
     bool no_active_sessions = rtsp_stream::session_count() == 0;
 
+#ifdef _WIN32
+    if (app_uses_window_capture) {
+      if (!requested_app->allow_client_commands || !named_cert_p->allow_client_commands) {
+        launch_session->client_do_cmds.clear();
+        launch_session->client_undo_cmds.clear();
+      }
+
+      const auto err = proc::start_window_app(*requested_app, launch_session);
+      if (err) {
+        tree.put("root.<xmlattr>.status_code", err);
+        tree.put(
+          "root.<xmlattr>.status_message",
+          err == 503
+            ? "Could not start the app or resolve its configured window. Check the window title and active window-stream limit."
+            : err == 409
+              ? "A full-monitor app is already running, or this window stream is already registered."
+              : "Failed to start the specified application");
+        tree.put("root.gamesession", 0);
+        return;
+      }
+    } else
+#endif
     if (is_input_only) {
       BOOST_LOG(info) << "Launching input only session..."sv;
 
@@ -1264,7 +1325,12 @@ namespace nvhttp {
       if (no_active_sessions && !proc::proc.virtual_display) {
         video::probe_encoders();
         if (current_appid == 0) {
-          proc::proc.launch_input_only();
+          if (const auto err = proc::proc.launch_input_only()) {
+            tree.put("root.resume", 0);
+            tree.put("root.<xmlattr>.status_code", err);
+            tree.put("root.<xmlattr>.status_message", "Another app or window-capture stream became active while starting the input-only session");
+            return;
+          }
         }
       }
     } else if (appid > 0 || !appuuid_str.empty()) {
@@ -1328,6 +1394,7 @@ namespace nvhttp {
       tree.put("root.<xmlattr>.status_code", 403);
       tree.put("root.<xmlattr>.status_message", "How did you get here?");
       tree.put("root.gamesession", 0);
+      return;
     }
 
     tree.put("root.<xmlattr>.status_code", 200);
@@ -1336,13 +1403,23 @@ namespace nvhttp {
       std::format(
         "{}{}:{}",
         launch_session->rtsp_url_scheme,
-        net::addr_to_url_escaped_string(request->local_endpoint().address()),
+        net::addr_to_url_escaped_string(local_endpoint.address()),
         static_cast<int>(net::map_port(rtsp_stream::RTSP_SETUP_PORT))
       )
     );
     tree.put("root.gamesession", 1);
 
-    rtsp_stream::launch_session_raise(launch_session);
+    if (!rtsp_stream::launch_session_raise(launch_session)) {
+#ifdef _WIN32
+      if (launch_session->window_capture) {
+        proc::stop_window_app(launch_session->id);
+      }
+#endif
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message", "Another stream is still setting up; retry after its RTSP setup completes.");
+      tree.put("root.gamesession", 0);
+      return;
+    }
   }
 
   void resume(bool &host_audio, resp_https_t response, req_https_t request) {
@@ -1389,6 +1466,19 @@ namespace nvhttp {
       return;
     }
 
+    decltype(request->remote_endpoint()) remote_endpoint;
+    decltype(request->local_endpoint()) local_endpoint;
+    try {
+      remote_endpoint = request->remote_endpoint();
+      local_endpoint = request->local_endpoint();
+    } catch (const std::exception &e) {
+      BOOST_LOG(error) << "Failed to get HTTP request endpoints: "sv << e.what();
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message", "Could not determine the client or host address");
+      return;
+    }
+
     // Newer Moonlight clients send localAudioPlayMode on /resume too,
     // so we should use it if it's present in the args and there are
     // no active sessions we could be interfering with.
@@ -1426,7 +1516,7 @@ namespace nvhttp {
       }
     }
 
-    auto encryption_mode = net::encryption_mode_for_address(request->remote_endpoint().address());
+    auto encryption_mode = net::encryption_mode_for_address(remote_endpoint.address());
     if (!launch_session->rtsp_cipher && encryption_mode == config::ENCRYPTION_MODE_MANDATORY) {
       BOOST_LOG(error) << "Rejecting client that cannot comply with mandatory encryption requirement"sv;
 
@@ -1443,13 +1533,18 @@ namespace nvhttp {
       std::format(
         "{}{}:{}",
         launch_session->rtsp_url_scheme,
-        net::addr_to_url_escaped_string(request->local_endpoint().address()),
+        net::addr_to_url_escaped_string(local_endpoint.address()),
         static_cast<int>(net::map_port(rtsp_stream::RTSP_SETUP_PORT))
       )
     );
     tree.put("root.resume", 1);
 
-    rtsp_stream::launch_session_raise(launch_session);
+    if (!rtsp_stream::launch_session_raise(launch_session)) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message", "Another stream is still setting up; retry after its RTSP setup completes.");
+      return;
+    }
 
 #if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
     system_tray::update_tray_client_connected(named_cert_p->name);
