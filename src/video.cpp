@@ -1424,7 +1424,10 @@ namespace video {
                 break;
               }
               if (window_capture) {
-                BOOST_LOG(error) << "The selected capture window is no longer available";
+                BOOST_LOG(error)
+                  << "Failed to initialize WGC for configured capture window ["
+                  << capture_ctxs.front().config.capture_window_title
+                  << "]; aborting the session without monitor fallback";
                 return;
               }
             }
@@ -2248,7 +2251,10 @@ namespace video {
     if (window_capture) {
       reset_display(disp, encoder.platform_formats->dev_type, "", synced_session_ctxs.front()->config);
       if (!disp) {
-        BOOST_LOG(error) << "The selected capture window is no longer available";
+        BOOST_LOG(error)
+          << "Failed to initialize WGC for configured capture window ["
+          << synced_session_ctxs.front()->config.capture_window_title
+          << "]; aborting the session without monitor fallback";
         return encode_e::error;
       }
     } else {
