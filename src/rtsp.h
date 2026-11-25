@@ -42,6 +42,8 @@ namespace rtsp_stream {
     bool input_only;
     bool window_capture {};
     std::uintptr_t capture_window_handle {};
+    std::string capture_app_name;
+    std::string capture_window_title;
     bool host_audio;
     int width;
     int height;

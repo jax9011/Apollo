@@ -238,6 +238,8 @@ namespace video {
       auto scalar = std::fminf((float) out_width / in_width, (float) out_height / in_height);
       out_width = in_width * scalar;
       out_height = in_height * scalar;
+      out_width = std::max(2, static_cast<int>(out_width) & ~1);
+      out_height = std::max(2, static_cast<int>(out_height) & ~1);
 
       sws_input_frame.reset(av_frame_alloc());
       sws_input_frame->width = in_width;
@@ -1199,7 +1201,7 @@ namespace video {
     if (window_capture) {
       disp = platf::display(encoder.platform_formats->dev_type, "", capture_ctxs.front().config);
       if (!disp) {
-        BOOST_LOG(error) << "Failed to initialize the selected window capture target";
+        BOOST_LOG(error) << "Failed to initialize the configured window capture target; monitor capture will not be used";
         return;
       }
     } else if (!proc::proc.display_name.empty()) {

@@ -35,5 +35,7 @@ namespace platf {
    */
   std::string to_utf8(const std::wstring_view &string);
 
-  HWND find_window_in_process_group(std::uintptr_t native_handle, std::wstring_view title);
+  HWND find_window_in_process_group(std::uintptr_t native_handle, std::wstring_view title, bool contains);
+  HWND find_window_by_title(std::wstring_view title, bool contains);
+  void log_window_candidates();
 }  // namespace platf

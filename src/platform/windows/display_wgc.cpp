@@ -296,6 +296,18 @@ namespace platf::dxgi {
       BOOST_LOG(error) << "Screen capture is not supported on this device for this release of Windows: failed to start capture: [0x"sv << util::hex(e.code()).to_string_view() << ']';
       return -1;
     }
+    if (window_capture) {
+      auto hwnd = reinterpret_cast<HWND>(config.capture_window_handle);
+      DWORD process_id {};
+      GetWindowThreadProcessId(hwnd, &process_id);
+      BOOST_LOG(info)
+        << "Window capture engaged: app [" << config.capture_app_name << "]"
+        << ", configured title [" << config.capture_window_title << "]"
+        << ", HWND [0x" << util::hex(config.capture_window_handle).to_string_view() << ']'
+        << ", PID [" << process_id << ']'
+        << ", window size [" << target_width << 'x' << target_height << ']'
+        << ", capture backend [WGC]";
+    }
     return 0;
   }
 
@@ -332,6 +344,7 @@ namespace platf::dxgi {
             return;
           }
           if (size.Width != target_width || size.Height != target_height) {
+            BOOST_LOG(info) << "Captured window size changed [" << target_width << 'x' << target_height << " -> " << size.Width << 'x' << size.Height << ']';
             frame.Close();
             sender.Recreate(
               uwp_device,

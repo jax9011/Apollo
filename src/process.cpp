@@ -660,29 +660,38 @@ namespace proc {
   }
 
 #ifdef _WIN32
-  HWND proc_t::wait_for_window(const std::wstring &title, std::chrono::seconds timeout) {
-    if (!_process_group) {
-      BOOST_LOG(error) << "Cannot resolve a capture window because the app has no tracked process group";
-      return nullptr;
-    }
-
+  HWND proc_t::wait_for_window(const std::wstring &title, bool contains, std::chrono::seconds timeout) {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {
-      auto hwnd = platf::find_window_in_process_group(
-        reinterpret_cast<std::uintptr_t>(_process_group.native_handle()),
-        title
-      );
-      if (hwnd) {
-        return hwnd;
+      if (!placebo && _process_group) {
+        auto hwnd = platf::find_window_in_process_group(
+          reinterpret_cast<std::uintptr_t>(_process_group.native_handle()),
+          title,
+          contains
+        );
+        if (hwnd) {
+          return hwnd;
+        }
       }
+
       if (!running()) {
         BOOST_LOG(error) << "Application exited before its configured capture window appeared";
+        platf::log_window_candidates();
         return nullptr;
       }
+
+      if (placebo) {
+        auto hwnd = platf::find_window_by_title(title, contains);
+        if (hwnd) {
+          return hwnd;
+        }
+      }
+
       std::this_thread::sleep_for(200ms);
     }
 
     BOOST_LOG(error) << "Timed out waiting for the configured application window";
+    platf::log_window_candidates();
     return nullptr;
   }
 
@@ -703,6 +712,10 @@ namespace proc {
       BOOST_LOG(error) << "A window app is already registered for launch session " << launch_session->id;
       return 409;
     }
+    if (app_config.capture_window_title_match != "exact" && app_config.capture_window_title_match != "contains") {
+      BOOST_LOG(error) << "Invalid capture-window-title-match value [" << app_config.capture_window_title_match << "]; expected [exact] or [contains]";
+      return 400;
+    }
 
     auto apps = proc.get_apps();
     auto instance = std::make_unique<proc_t>(proc.get_env(), std::move(apps));
@@ -711,7 +724,11 @@ namespace proc {
       return status;
     }
 
-    auto hwnd = instance->wait_for_window(platf::from_utf8(app_config.capture_window_title), 15s);
+    auto hwnd = instance->wait_for_window(
+      platf::from_utf8(app_config.capture_window_title),
+      app_config.capture_window_title_match == "contains",
+      15s
+    );
     if (!hwnd) {
       instance->terminate(false, false);
       return 503;
@@ -719,6 +736,8 @@ namespace proc {
 
     launch_session->window_capture = true;
     launch_session->capture_window_handle = reinterpret_cast<std::uintptr_t>(hwnd);
+    launch_session->capture_app_name = app_config.name;
+    launch_session->capture_window_title = app_config.capture_window_title;
     window_app_sessions.emplace(launch_session->id, std::move(instance));
     return 0;
   }
@@ -1516,6 +1535,7 @@ namespace proc {
 #ifdef _WIN32
           if (app_node.contains("capture-window-title"))
             ctx.capture_window_title = parse_env_val(this_env, app_node.value("capture-window-title", ""));
+          ctx.capture_window_title_match = app_node.value("capture-window-title-match", "exact");
 #endif
 
           ctx.elevated = app_node.value("elevated", false);

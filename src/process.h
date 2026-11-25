@@ -88,6 +88,7 @@ namespace proc {
     std::string output;
     std::string image_path;
     std::string capture_window_title;
+    std::string capture_window_title_match = "exact";
     std::string id;
     std::string gamepad;
     bool elevated;
@@ -144,7 +145,7 @@ namespace proc {
     void terminate(bool immediate = false, bool needs_refresh = true);
 
 #ifdef _WIN32
-    HWND wait_for_window(const std::wstring &title, std::chrono::seconds timeout);
+    HWND wait_for_window(const std::wstring &title, bool contains, std::chrono::seconds timeout);
 #endif
 
   private:

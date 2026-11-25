@@ -1371,9 +1371,38 @@ namespace platf {
     std::wstring title;
     HWND match {};
     bool ambiguous {};
+    bool contains {};
+    bool filter_process_ids {};
   };
 
-  static BOOL CALLBACK find_window_in_group(HWND hwnd, LPARAM lParam) {
+  static bool window_title_matches(std::wstring_view window_title, std::wstring_view title, bool contains) {
+    if (!contains) {
+      return CompareStringOrdinal(
+               window_title.data(),
+               static_cast<int>(window_title.size()),
+               title.data(),
+               static_cast<int>(title.size()),
+               TRUE
+             ) == CSTR_EQUAL;
+    }
+    if (title.size() > window_title.size()) {
+      return false;
+    }
+    for (std::size_t offset = 0; offset <= window_title.size() - title.size(); ++offset) {
+      if (CompareStringOrdinal(
+            window_title.data() + offset,
+            static_cast<int>(title.size()),
+            title.data(),
+            static_cast<int>(title.size()),
+            TRUE
+          ) == CSTR_EQUAL) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  static BOOL CALLBACK find_matching_window(HWND hwnd, LPARAM lParam) {
     auto context = reinterpret_cast<find_window_context_t *>(lParam);
     if (!IsWindowVisible(hwnd)) {
       return TRUE;
@@ -1381,7 +1410,7 @@ namespace platf {
 
     DWORD process_id {};
     GetWindowThreadProcessId(hwnd, &process_id);
-    if (!context->process_ids.contains(process_id)) {
+    if (context->filter_process_ids && !context->process_ids.contains(process_id)) {
       return TRUE;
     }
 
@@ -1392,7 +1421,7 @@ namespace platf {
 
     std::wstring window_title(static_cast<std::size_t>(title_length) + 1, L'\0');
     auto copied = GetWindowTextW(hwnd, window_title.data(), static_cast<int>(window_title.size()));
-    if (copied <= 0 || _wcsicmp(window_title.c_str(), context->title.c_str()) != 0) {
+    if (copied <= 0 || !window_title_matches(std::wstring_view {window_title.data(), static_cast<std::size_t>(copied)}, context->title, context->contains)) {
       return TRUE;
     }
 
@@ -1405,9 +1434,14 @@ namespace platf {
     return TRUE;
   }
 
-  HWND find_window_in_process_group(std::uintptr_t native_handle, std::wstring_view title) {
+  static HWND find_matching_window(find_window_context_t &context) {
+    EnumWindows(find_matching_window, reinterpret_cast<LPARAM>(&context));
+    return context.ambiguous ? nullptr : context.match;
+  }
+
+  HWND find_window_in_process_group(std::uintptr_t native_handle, std::wstring_view title, bool contains) {
     if (native_handle == 0 || title.empty()) {
-      BOOST_LOG(error) << "Cannot find app window without a process group and exact window title";
+      BOOST_LOG(error) << "Cannot find app window without a process group and configured title";
       return nullptr;
     }
 
@@ -1439,19 +1473,55 @@ namespace platf {
 
     find_window_context_t context;
     context.title.assign(title);
+    context.contains = contains;
+    context.filter_process_ids = true;
     for (DWORD i = 0; i < process_id_list->NumberOfProcessIdsInList; ++i) {
       context.process_ids.emplace(static_cast<DWORD>(process_id_list->ProcessIdList[i]));
     }
 
-    EnumWindows(find_window_in_group, reinterpret_cast<LPARAM>(&context));
-    if (context.ambiguous) {
-      BOOST_LOG(error) << "More than one app window matches the configured title";
+    return find_matching_window(context);
+  }
+
+  HWND find_window_by_title(std::wstring_view title, bool contains) {
+    if (title.empty()) {
+      BOOST_LOG(error) << "Cannot find app window without a configured title";
       return nullptr;
     }
-    if (!context.match) {
-      BOOST_LOG(debug) << "No app window matches the configured title yet";
+
+    find_window_context_t context;
+    context.title.assign(title);
+    context.contains = contains;
+    return find_matching_window(context);
+  }
+
+  static BOOL CALLBACK log_window_candidate(HWND hwnd, LPARAM) {
+    if (!IsWindowVisible(hwnd)) {
+      return TRUE;
     }
-    return context.match;
+
+    auto title_length = GetWindowTextLengthW(hwnd);
+    if (title_length <= 0) {
+      return TRUE;
+    }
+
+    std::wstring window_title(static_cast<std::size_t>(title_length) + 1, L'\0');
+    auto copied = GetWindowTextW(hwnd, window_title.data(), static_cast<int>(window_title.size()));
+    if (copied <= 0) {
+      return TRUE;
+    }
+
+    DWORD process_id {};
+    GetWindowThreadProcessId(hwnd, &process_id);
+    BOOST_LOG(debug)
+      << "Capture window candidate: title [" << to_utf8(std::wstring_view {window_title.data(), static_cast<std::size_t>(copied)}) << "]"
+      << ", PID [" << process_id << "]"
+      << ", HWND [0x" << util::hex(reinterpret_cast<std::uintptr_t>(hwnd)).to_string_view() << ']';
+    return TRUE;
+  }
+
+  void log_window_candidates() {
+    BOOST_LOG(debug) << "Visible top-level windows considered for capture:";
+    EnumWindows(log_window_candidate, 0);
   }
 
   bool process_group_running(std::uintptr_t native_handle) {

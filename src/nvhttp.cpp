@@ -1176,6 +1176,12 @@ namespace nvhttp {
     bool app_uses_window_capture = false;
 #ifdef _WIN32
     app_uses_window_capture = requested_app != apps.end() && !requested_app->capture_window_title.empty();
+    if (requested_app != apps.end()) {
+      BOOST_LOG(debug)
+        << "Requested app [" << requested_app->name << "] has configured capture title ["
+        << requested_app->capture_window_title << "] with match mode ["
+        << requested_app->capture_window_title_match << ']';
+    }
 #endif
 
     auto named_cert_p = get_verified_cert(request);
@@ -1305,7 +1311,7 @@ namespace nvhttp {
         tree.put(
           "root.<xmlattr>.status_message",
           err == 503
-            ? "Could not start the app or resolve its configured window. Check the window title and active window-stream limit."
+            ? "Could not start window capture. Verify the configured title, match mode, and active window-stream limit; monitor capture was not started."
             : err == 409
               ? "A full-monitor app is already running, or this window stream is already registered."
               : "Failed to start the specified application");

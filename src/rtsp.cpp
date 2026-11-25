@@ -1099,6 +1099,12 @@ namespace rtsp_stream {
 
       config.monitor.input_only = session.input_only;
       config.monitor.capture_window_handle = session.capture_window_handle;
+      config.monitor.capture_app_name = session.capture_app_name;
+      config.monitor.capture_window_title = session.capture_window_title;
+      if (config.monitor.capture_window_handle) {
+        config.monitor.width = std::max(2, config.monitor.width & ~1);
+        config.monitor.height = std::max(2, config.monitor.height & ~1);
+      }
 
       configuredBitrateKbps = util::from_view(args.at("x-ml-video.configuredBitrateKbps"sv));
 

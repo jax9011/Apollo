@@ -1007,26 +1007,19 @@ namespace platf {
    */
   std::shared_ptr<display_t> display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config) {
     if (config.capture_window_handle) {
-      if (config::video.capture == "ddx") {
-        BOOST_LOG(error) << "Window capture requires the Windows Graphics Capture backend";
-        return nullptr;
-      }
-
-      if (config::video.capture == "wgc" || config::video.capture.empty()) {
-        if (hwdevice_type == mem_type_e::dxgi) {
-          auto disp = std::make_shared<dxgi::display_wgc_vram_t>();
-          if (!disp->init(config, display_name)) {
-            return disp;
-          }
-        } else if (hwdevice_type == mem_type_e::system) {
-          auto disp = std::make_shared<dxgi::display_wgc_ram_t>();
-          if (!disp->init(config, display_name)) {
-            return disp;
-          }
+      if (hwdevice_type == mem_type_e::dxgi) {
+        auto disp = std::make_shared<dxgi::display_wgc_vram_t>();
+        if (!disp->init(config, display_name)) {
+          return disp;
+        }
+      } else if (hwdevice_type == mem_type_e::system) {
+        auto disp = std::make_shared<dxgi::display_wgc_ram_t>();
+        if (!disp->init(config, display_name)) {
+          return disp;
         }
       }
 
-      BOOST_LOG(error) << "Window capture is not supported by the selected encoder device";
+      BOOST_LOG(error) << "Window capture requires the Windows Graphics Capture backend, which is not supported by the selected encoder device";
       return nullptr;
     }
 

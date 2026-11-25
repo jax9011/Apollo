@@ -243,6 +243,14 @@
             aria-describedby="captureWindowTitleHelp" v-model="editForm['capture-window-title']" />
           <div id="captureWindowTitleHelp" class="form-text">{{ $t('apps.capture_window_title_desc') }}</div>
         </div>
+        <div class="mb-3" v-if="platform === 'windows'">
+          <label for="captureWindowTitleMatch" class="form-label">{{ $t('apps.capture_window_title_match') }}</label>
+          <select class="form-select" id="captureWindowTitleMatch" v-model="editForm['capture-window-title-match']">
+            <option value="exact">{{ $t('apps.capture_window_title_match_exact') }}</option>
+            <option value="contains">{{ $t('apps.capture_window_title_match_contains') }}</option>
+          </select>
+          <div class="form-text">{{ $t('apps.capture_window_title_match_desc') }}</div>
+        </div>
         <!-- elevation -->
         <Checkbox v-if="platform === 'windows'"
                   class="mb-3"
@@ -539,6 +547,7 @@
     "output": "",
     "cmd": "",
     "capture-window-title": "",
+    "capture-window-title-match": "exact",
     "exclude-global-prep-cmd": false,
     "exclude-global-state-cmd": false,
     "elevated": false,
