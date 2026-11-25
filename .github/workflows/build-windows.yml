@@ -49,3 +49,18 @@ jobs:
       - name: Build
         shell: msys2 {0}
         run: cmake --build cmake-build-windows --parallel
+
+      - name: Package
+        shell: msys2 {0}
+        continue-on-error: true
+        run: cmake --build cmake-build-windows --target package
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Apollo-Windows
+          path: |
+            cmake-build-windows/cpack_artifacts/*
+            cmake-build-windows/*.exe
+            cmake-build-windows/sunshine.exe
+          if-no-files-found: warn
