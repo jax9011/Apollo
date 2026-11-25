@@ -541,11 +541,7 @@ namespace rtsp_stream {
         if (launch_session->id != launch_session_id) {
           BOOST_LOG(error) << "Attempted to clear unexpected session: "sv << launch_session_id << " vs "sv << launch_session->id;
         } else {
-          boost::system::error_code ec;
-          raised_timer.cancel(ec);
-          if (ec) {
-            BOOST_LOG(error) << "Failed to cancel RTSP launch timeout: "sv << ec.message();
-          }
+          raised_timer.cancel();
           launch_event.pop();
         }
       }
@@ -555,11 +551,7 @@ namespace rtsp_stream {
       std::shared_ptr<launch_session_t> pending_session;
       {
         std::lock_guard lock(_launch_mutex);
-        boost::system::error_code ec;
-        raised_timer.cancel(ec);
-        if (ec) {
-          BOOST_LOG(error) << "Failed to cancel pending RTSP launch timeout: "sv << ec.message();
-        }
+        raised_timer.cancel();
         pending_session = launch_event.pop(0s);
       }
 #ifdef _WIN32
@@ -922,10 +914,6 @@ namespace rtsp_stream {
   }
 
   void cmd_setup(rtsp_server_t *server, tcp::socket &sock, launch_session_t &session, msg_t &&req) {
-    auto discard_launch_on_failure = util::fail_guard([&]() {
-      discard_failed_launch(server, session);
-    });
-
     OPTION_ITEM options[4] {};
 
     auto &seqn = options[0];
@@ -985,6 +973,10 @@ namespace rtsp_stream {
   }
 
   void cmd_announce(rtsp_server_t *server, tcp::socket &sock, launch_session_t &session, msg_t &&req) {
+    auto discard_launch_on_failure = util::fail_guard([&]() {
+      discard_failed_launch(server, session);
+    });
+
     OPTION_ITEM option {};
 
     // I know these string literals will not be modified
